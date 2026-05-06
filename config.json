@@ -1,0 +1,62 @@
+{
+  "send": {
+    "workers": 5,
+    "maxLoopTx": 10000000,
+    "minDelayTxSeconds": 10,
+    "maxDelayTxSeconds": 100,
+    "amount": {
+      "min": "25",
+      "max": "28",
+      "decimals": 3
+    }
+  },
+  "swap": {
+    "enabled": true,
+    "mode": "ring-hybrid",
+    "workers": 5,
+    "minEdgeBps": 25,
+    "minOrderSizeUsd": 1.05,
+    "maxOrderSizeUsd": 10,
+    "minDelaySeconds": 30,
+    "maxDelaySeconds": 90,
+    "maxLoopTakes": 100,
+    "allowedPairs": [
+      "cc_usdcx",
+      "usdcx_cc"
+    ],
+    "ring": {
+      "enabled": true,
+      "baseAmountUsd": 5,
+      "amountJitterPercent": 5,
+      "legMinJitterSeconds": 600,
+      "legMaxJitterSeconds": 1800,
+      "maxDriftBps": 50,
+      "listingExpiresHours": 1,
+      "camouflageEnabled": true,
+      "camouflageProbability": 0.3
+    }
+  },
+  "captcha": {
+    "provider": "2captcha",
+    "solverUrl": [
+      ""
+    ],
+    "apiKey": ""
+  },
+  "safety": {
+    "minHoldBalanceCc": 1
+  },
+  "ui": {
+    "dashboard": true,
+    "logLines": 15
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "",
+    "allowedChatIds": [],
+    "autoReport": {
+      "enabled": true,
+      "intervalMinutes": 30
+    }
+  }
+}
