@@ -37,10 +37,11 @@
     }
   },
   "captcha": {
-    "provider": "multibot",
-    "solverUrl": "",
-    "apiKeyMultibot": "ISI_API_KEY_MULTIBOT_KAMU",
-    "apiKey": "ISI_API_KEY_2CAPTCHA_KAMU"
+    "provider": "2captcha",
+    "solverUrl": [
+      ""
+    ],
+    "apiKey": ""
   },
   "safety": {
     "minHoldBalanceCc": 1
