@@ -12,28 +12,32 @@
   },
   "swap": {
     "enabled": true,
-    "mode": "ring-hybrid",
-    "workers": 5,
-    "minEdgeBps": 25,
+    "workers": 10,
     "minOrderSizeUsd": 1.05,
-    "maxOrderSizeUsd": 10,
-    "minDelaySeconds": 30,
-    "maxDelaySeconds": 90,
-    "maxLoopTakes": 100,
+    "maxOrderSizeUsd": 1.5,
+    "minDelaySeconds": 5,
+    "maxDelaySeconds": 10,
+    "maxLoopTakes": 100000,
     "allowedPairs": [
-      "cc_usdcx",
-      "usdcx_cc"
+      "usdc_cc"
     ],
-    "ring": {
-      "enabled": true,
-      "baseAmountUsd": 5,
-      "amountJitterPercent": 5,
-      "legMinJitterSeconds": 600,
-      "legMaxJitterSeconds": 1800,
-      "maxDriftBps": 50,
-      "listingExpiresHours": 1,
-      "camouflageEnabled": true,
-      "camouflageProbability": 0.3
+    "maker": {
+      "minBps": 1,
+      "maxBps": 1,
+      "expiresHours": 6,
+      "maxOpenOrders": 2,
+      "rateLimitCooldownMinutes": 60,
+      "balanceLockCooldownSeconds": 120,
+      "takerIdleSecondsBeforeMaker": 10,
+      "cancelAfterIdleMinutes": 5
+    },
+    "taker": {
+      "minBps": 1,
+      "maxTakesPerCounterpartyPerWeek": 5,
+      "balanceLockCooldownSeconds": 90,
+      "orderBlacklistSeconds": 60,
+      "maxDrainPerLoop": 10,
+      "fastScanIntervalSeconds": 2
     }
   },
   "captcha": {
@@ -41,7 +45,7 @@
     "solverUrl": [
       ""
     ],
-    "apiKey": ""
+    "apiKey": "uaDYSg1dyYlQgamtOWQgVDJH1bqa9r8i"
   },
   "safety": {
     "minHoldBalanceCc": 1
@@ -52,8 +56,8 @@
   },
   "telegram": {
     "enabled": true,
-    "botToken": "",
-    "allowedChatIds": [],
+    "botToken": "8776128404:AAG9AoJk2mB_N4ovGIWtCttoM0UnY9TNPoY"",
+    "allowedChatIds": [1118073042],
     "autoReport": {
       "enabled": true,
       "intervalMinutes": 30
