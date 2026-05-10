@@ -341,6 +341,104 @@ const sendPairHistory = new Map();
 // key: "sender=>recipient", value: block-until timestamp (ms)
 const reciprocalSendCooldowns = new Map();
 
+// OTC counterparty take history — global across all taker accounts.
+// Resets every Saturday 00:00 UTC (= Saturday 07:00 WIB), aligned with Roots'
+// rewards weekly snapshot. /api/account/rewards penalties counter resets too.
+// key: makerUsername (lowercased), value: number[] of successful take timestamps (ms)
+const otcCounterpartyTakeHistory = new Map();
+
+function normalizeOtcUsername(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+// Returns timestamp (ms) of the most recent Saturday 00:00:00 UTC at or before nowMs.
+// UTC day index: Sun=0, Mon=1, ..., Sat=6. Days back to Saturday: (dayUTC + 1) % 7.
+function getLastSaturdayMidnightUTC(nowMs) {
+  const d = new Date(nowMs);
+  const dayUTC = d.getUTCDay();
+  const daysBack = (dayUTC + 1) % 7;
+  return Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate() - daysBack,
+    0, 0, 0, 0
+  );
+}
+
+function getNextCounterpartyResetMs(nowMs) {
+  return getLastSaturdayMidnightUTC(nowMs) + 7 * 24 * 60 * 60 * 1000;
+}
+
+function pruneOtcCounterpartyHistory(username, nowMs) {
+  const key = normalizeOtcUsername(username);
+  if (!key) return [];
+  const arr = otcCounterpartyTakeHistory.get(key);
+  if (!Array.isArray(arr) || arr.length === 0) {
+    if (arr) otcCounterpartyTakeHistory.delete(key);
+    return [];
+  }
+  const cutoff = getLastSaturdayMidnightUTC(nowMs);
+  const fresh = arr.filter((t) => t >= cutoff);
+  if (fresh.length === 0) {
+    otcCounterpartyTakeHistory.delete(key);
+  } else if (fresh.length !== arr.length) {
+    otcCounterpartyTakeHistory.set(key, fresh);
+  }
+  return fresh;
+}
+
+function getOtcCounterpartyTakeCount(username) {
+  return pruneOtcCounterpartyHistory(username, Date.now()).length;
+}
+
+function recordOtcCounterpartyTake(username) {
+  const key = normalizeOtcUsername(username);
+  if (!key) return;
+  const nowMs = Date.now();
+  const fresh = pruneOtcCounterpartyHistory(key, nowMs);
+  fresh.push(nowMs);
+  otcCounterpartyTakeHistory.set(key, fresh);
+}
+
+// Short-lived blacklist for orders that returned HTTP 409 (already reserved/closed)
+// or HTTP 400 "balance below required" on take. key: orderId, value: until-ms
+const otcOrderBlacklist = new Map();
+
+function blacklistOtcOrder(orderId, ttlMs) {
+  if (!orderId) return;
+  const ttl = Math.max(1000, Number(ttlMs) || 60000);
+  otcOrderBlacklist.set(String(orderId), Date.now() + ttl);
+}
+
+function isOtcOrderBlacklisted(orderId) {
+  if (!orderId) return false;
+  const until = otcOrderBlacklist.get(String(orderId));
+  if (!until) return false;
+  if (until <= Date.now()) {
+    otcOrderBlacklist.delete(String(orderId));
+    return false;
+  }
+  return true;
+}
+
+function pruneOtcOrderBlacklist() {
+  const now = Date.now();
+  for (const [id, until] of otcOrderBlacklist.entries()) {
+    if (until <= now) otcOrderBlacklist.delete(id);
+  }
+}
+
+function isOtcBalanceLockError(errMsg) {
+  const text = String(errMsg || "").toLowerCase();
+  return text.includes("400") && text.includes("available canton balance is below");
+}
+
+function isOtcOrderClosedError(errMsg) {
+  const text = String(errMsg || "").toLowerCase();
+  return (text.includes("409") && (text.includes("no longer open") || text.includes("reserved by someone")))
+    || text.includes("order is no longer open");
+}
+
 // Continuous scheduler state
 // key: accountName, value: earliest timestamp (ms) the account may send again
 const nextAvailableAtByAccount = new Map();
@@ -774,7 +872,7 @@ function getPerAccountTxStats(accountName) {
 // ============================================================================
 
 const latestCcBalanceByAccount = new Map();
-const latestUsdcxBalanceByAccount = new Map();
+const latestUsdcBaseByAccount = new Map();
 
 function updateAccountCcBalance(accountName, ccNumeric) {
   const name = String(accountName || "").trim();
@@ -789,16 +887,16 @@ function getAccountCcBalance(accountName) {
   return entry ? entry.cc : null;
 }
 
-function updateAccountUsdcxBalance(accountName, usdcxNumeric) {
+function updateAccountUsdcBalance(accountName, usdcNumeric) {
   const name = String(accountName || "").trim();
   if (!name) return;
-  const usdcx = Number(usdcxNumeric);
-  if (!Number.isFinite(usdcx) || usdcx < 0) return;
-  latestUsdcxBalanceByAccount.set(name, usdcx);
+  const usdc = Number(usdcNumeric);
+  if (!Number.isFinite(usdc) || usdc < 0) return;
+  latestUsdcBaseByAccount.set(name, usdc);
 }
 
-function getAccountUsdcxBalance(accountName) {
-  return latestUsdcxBalanceByAccount.get(String(accountName || "").trim()) ?? null;
+function getAccountUsdcBalance(accountName) {
+  return latestUsdcBaseByAccount.get(String(accountName || "").trim()) ?? null;
 }
 
 // Per-account send target tracking (who is the current/last recipient)
@@ -1122,7 +1220,8 @@ const INTERNAL_API_DEFAULTS = {
     marketOtcPythPanel: "/api/market/otc-pyth-panel",
     crossOtcOrders: "/api/cross-otc/orders",
     crossOtcReference: "/api/cross-otc/reference",
-    crossOtcStats: "/api/cross-otc/stats"
+    crossOtcStats: "/api/cross-otc/stats",
+    accountRewards: "/api/account/rewards"
   },
   headers: {
     userAgent:
@@ -1368,10 +1467,11 @@ class PinnedDashboard {
   parseBalanceFields() {
     const raw = String(this.state.balance || "");
     const matchCc = raw.match(/CC=([^|]+)/i);
-    const matchUsdcx = raw.match(/USDCx=([^|]+)/i);
+    // Extract USDC Base from balance string
+    const matchUsdc = raw.match(/USDC=([^|]+)/i);
     return {
       cc: matchCc ? String(matchCc[1]).trim() : "-",
-      usdcx: matchUsdcx ? String(matchUsdcx[1]).trim() : "-"
+      usdc: matchUsdc ? String(matchUsdc[1]).trim() : "-"
     };
   }
 
@@ -1395,7 +1495,7 @@ class PinnedDashboard {
     this.accountSnapshots[selected] = {
       status: this.mapPhaseToStatus(this.state.phase),
       cc: balances.cc !== "-" ? balances.cc : String(prev.cc || "-"),
-      usdcx: balances.usdcx !== "-" ? balances.usdcx : String(prev.usdcx || "-"),
+      usdc: balances.usdc !== "-" ? balances.usdc : String(prev.usdc || "-"),
       progress: currentProgress !== "-" ? currentProgress : String(prev.progress || "-"),
       send: currentSend !== "-" ? currentSend : String(prev.send || "-"),
       reward: currentReward !== "-" ? currentReward : String(prev.reward || "-"),
@@ -1461,9 +1561,9 @@ class PinnedDashboard {
         cc: isSelected
           ? (balances.cc !== "-" ? balances.cc : String(snapshot.cc || "-"))
           : String(snapshot.cc || "-"),
-        usdcx: isSelected
-          ? (balances.usdcx !== "-" ? balances.usdcx : String(snapshot.usdcx || "-"))
-          : String(snapshot.usdcx || "-"),
+        usdc: isSelected
+          ? (balances.usdc !== "-" ? balances.usdc : String(snapshot.usdc || "-"))
+          : String(snapshot.usdc || "-"),
         progress: isSelected ? currentProgress : String(snapshot.progress || "-"),
         send: isSelected
           ? (String(this.state.send || "-") !== "-" ? String(this.state.send || "-") : String(snapshot.send || "-"))
@@ -1490,7 +1590,7 @@ class PinnedDashboard {
         token: "-",
         active: true,
         cc: balances.cc !== "-" ? balances.cc : String(snapshot.cc || "-"),
-        usdcx: balances.usdcx !== "-" ? balances.usdcx : String(snapshot.usdcx || "-"),
+        usdc: balances.usdc !== "-" ? balances.usdc : String(snapshot.usdc || "-"),
         progress: currentProgress,
         send: String(this.state.send || "-") !== "-" ? String(this.state.send || "-") : String(snapshot.send || "-"),
         reward: String(this.state.reward || "-") !== "-" ? String(this.state.reward || "-") : String(snapshot.reward || "-"),
@@ -1552,22 +1652,8 @@ class PinnedDashboard {
     const L = [];
     const timeStr = (now.split(" ").pop() || now).slice(0, 8);
 
-    L.push(`${C.bold}${C.cyan}⚡RootsFi V14${C.rst} ${C.dim}${timeStr}${C.rst}`);
+    L.push(`${C.bold}${C.cyan}⚡RootsFi V15${C.rst} ${C.dim}${timeStr}${C.rst}`);
     L.push(`${C.dim}${rows.length} Akun ${modeLabel}${C.rst}`);
-    L.push(
-      `${C.green}✓${this.state.swapsOk}${C.rst} ` +
-      `${C.red}✗${this.state.swapsFail}${C.rst} ` +
-      `${C.dim}Σ${C.rst}${this.state.swapsTotal} ` +
-      `${C.dim}tgt${C.rst}${this.state.targetPerDay}${C.dim}/d${C.rst}`
-    );
-
-    const rwk = getTotalRewardsThisWeek();
-    const rdf = getTotalRewardsDiff();
-    L.push(
-      `${C.dim}Rwd ${C.rst}${rwk.cc.toFixed(1)} ` +
-      `${rdf.cc >= 0 ? C.green + "+" : C.red}${rdf.cc.toFixed(1)}${C.rst}` +
-      `${C.dim}CC $${rwk.usd.toFixed(0)}${C.rst}`
-    );
 
     const uptimeLabel = getGlobalUptimeLabel();
     const phColor = {
@@ -1647,19 +1733,22 @@ class PinnedDashboard {
     if (rows.length === 0) {
       L.push(`${C.dim}(no accts)${C.rst}`);
     } else {
-      // Column header: Akun | Sts | CC | USDCx | Tx | To | CD
-      const uxW = 6; // USDCx width
-      const toW = Math.max(4, Math.min(8, Math.floor(LW * 0.14))); // To (recipient) width
-      const cdW = 4; // CD (cooldown) width
+      // Column header: Akun | Sts | CC | USDC | ETH | mk | tk | pts | pen
+      const uxW = 6; // USDC width
+      const ethW = 6; // ETH width
+      const ptsW = 4; // pts width
+      const penW = 4; // pen width
 
       L.push(
         `${C.dim} ${"Akun".padEnd(nameW)} ` +
         `${"Sts".padEnd(stW)} ` +
         `${"CC".padEnd(6)} ` +
-        `${"USDCx".padEnd(uxW)} ` +
-        `${"Tx".padEnd(4)} ` +
-        `${"To".padEnd(toW)} ` +
-        `${"CD".padEnd(cdW)}${C.rst}`
+        `${"USDC".padEnd(uxW)} ` +
+        `${"ETH".padEnd(ethW)} ` +
+        `${"mk".padEnd(3)} ` +
+        `${"tk".padEnd(3)} ` +
+        `${"pts".padEnd(ptsW)} ` +
+        `${"pen".padEnd(penW)}${C.rst}`
       );
 
       const stMap = {
@@ -1672,35 +1761,62 @@ class PinnedDashboard {
         IDLE: C.dim, SEND: C.green, COOL: C.yellow,
         SECU: C.magenta, SESS: C.cyan, "OTP!": C.red,
         OTPV: C.red, SYNC: C.blue, "QUE ": C.dim,
-        "DRY ": C.yellow, DONE: C.green
+        "DRY ": C.yellow, DONE: C.green,
+        TAKE: C.green, MAKE: C.cyan, WAIT: C.dim, LOCK: C.yellow
       };
 
       for (const row of rows) {
         const st = stMap[row.status] || row.status.slice(0, stW);
         const stColor = stColorMap[st] || C.white;
         const ccVal = fmtCc(row.cc);
-        const uxVal = fmtCc(row.usdcx);
+        const uxVal = fmtCc(row.usdc);
         const marker = row.active ? `${C.bold}›` : " ";
 
-        const txStats = getPerAccountTxStats(row.name);
-        const txLbl = `${txStats.ok}/${txStats.fail}`.padEnd(4);
+        const snapshot = isObject(this.accountSnapshots[row.name]) ? this.accountSnapshots[row.name] : {};
+        // mk = successful maker creates, tk = successful taker takes (per-account, OTC modes)
+        // For non-OTC modes, fall back to per-account TX stats split (ok/fail).
+        const mkRaw = snapshot.mk;
+        const tkRaw = snapshot.tk;
+        let mkLbl, tkLbl;
+        if (mkRaw === undefined && tkRaw === undefined) {
+          const txStats = getPerAccountTxStats(row.name);
+          mkLbl = String(txStats.ok || 0).padEnd(3);
+          tkLbl = String(txStats.fail || 0).padEnd(3);
+        } else {
+          mkLbl = String(Number(mkRaw) || 0).padEnd(3);
+          tkLbl = String(Number(tkRaw) || 0).padEnd(3);
+        }
 
-        // To: last recipient name (from per-account tracking)
-        const toTarget = getLastSendTarget(row.name);
-        const toLabel = toTarget ? this.clip(toTarget, toW).padEnd(toW) : "-".padEnd(toW);
+        // ETH balance (Base chain)
+        const ethRaw = snapshot.eth;
+        const ethLabel = (ethRaw !== undefined && ethRaw !== "-" && ethRaw !== null)
+          ? String(ethRaw).padEnd(ethW)
+          : "-".padEnd(ethW);
 
-        // CD: per-account cooldown remaining seconds
-        const cdSec = getAccountCooldownRemainingSec(row.name);
-        const cdLabel = cdSec > 0 ? `${cdSec}s`.padEnd(cdW) : "-".padEnd(cdW);
+        // pts: account totalPoints from /api/account/rewards (snapshot)
+        const ptsRaw = snapshot.pts;
+        const ptsLabel = (ptsRaw !== undefined && ptsRaw !== "-" && ptsRaw !== null)
+          ? String(ptsRaw).padEnd(ptsW)
+          : "-".padEnd(ptsW);
+
+        // pen: total deducted points (sum of penalties)
+        const penRaw = snapshot.pen;
+        const penNum = Number(penRaw);
+        const penLabel = Number.isFinite(penNum)
+          ? (penNum > 0 ? `-${penNum}` : "0").padEnd(penW)
+          : "-".padEnd(penW);
+        const penColor = Number.isFinite(penNum) && penNum > 0 ? C.red : C.dim;
 
         L.push(
           `${marker}${this.clip(row.name, nameW).padEnd(nameW)} ${C.rst}` +
           `${stColor}${st}${C.rst} ` +
           `${C.cyan}${ccVal.padEnd(6)}${C.rst} ` +
           `${C.yellow}${uxVal.padEnd(uxW)}${C.rst} ` +
-          `${C.dim}${txLbl}${C.rst} ` +
-          `${C.dim}${toLabel}${C.rst} ` +
-          `${cdSec > 0 ? C.yellow : C.dim}${cdLabel}${C.rst}`
+          `${C.blue}${ethLabel}${C.rst} ` +
+          `${C.green}${mkLbl}${C.rst} ` +
+          `${C.cyan}${tkLbl}${C.rst} ` +
+          `${C.magenta}${ptsLabel}${C.rst} ` +
+          `${penColor}${penLabel}${C.rst}`
         );
       }
     }
@@ -2426,33 +2542,29 @@ async function promptSendMode() {
 
   try {
     console.log("\n=== RootsFi Bot - Mode ===");
-    console.log("1. Send Internal (kirim CC antar akun sendiri)");
-    console.log("2. OTC Trading (coming soon)");
-    console.log("3. Balance Only (cek saldo saja)");
+    console.log("1. Send Internal     (kirim CC antar akun sendiri)");
+    console.log("2. OTC Maker         (buat listing — jual CC, terima USDC)");
+    console.log("3. OTC Taker         (ambil order orang lain)");
+    console.log("4. OTC Maker-Taker   (siklus Maker→429→Taker)");
+    console.log("5. Balance Only      (cek saldo saja)");
     console.log("");
     console.log("Mode tambahan (legacy, akses via input langsung):");
     console.log("  e = External (random dari recipient.txt)");
     console.log("  o = OTP (request OTP tiap akun & simpan sesi)");
     console.log("");
 
-    const answer = await rl.question("Pilih mode [1/2/3]: ");
+    const answer = await rl.question("Pilih mode [1/2/3/4/5]: ");
     const choice = answer.trim().toLowerCase();
 
-    if (choice === "1") {
-      return "internal";
-    } else if (choice === "2") {
-      console.log("[init] OTC Trading: coming soon");
-      return "coming-soon";
-    } else if (choice === "3") {
-      return "balance-only";
-    } else if (choice === "e") {
-      return "external";
-    } else if (choice === "o") {
-      return "otp";
-    } else {
-      console.log("[warn] Pilihan tidak valid, default ke balance-only");
-      return "balance-only";
-    }
+    if (choice === "1") return "internal";
+    if (choice === "2") return "otc-maker";
+    if (choice === "3") return "otc-taker";
+    if (choice === "4") return "otc-maker-taker";
+    if (choice === "5") return "balance-only";
+    if (choice === "e") return "external";
+    if (choice === "o") return "otp";
+    console.log("[warn] Pilihan tidak valid, default ke balance-only");
+    return "balance-only";
   } finally {
     rl.close();
   }
@@ -3281,6 +3393,8 @@ function normalizeConfig(rawConfig) {
     enabled: ringInput.camouflageEnabled,
     probabilityPerLeg: ringInput.camouflageProbability
   };
+  const makerInput = isObject(swapInput.maker) ? swapInput.maker : {};
+  const takerInput = isObject(swapInput.taker) ? swapInput.taker : {};
   const swap = {
     enabled: swapInput.enabled !== false,
     mode: String(swapInput.mode || "ring-hybrid").toLowerCase(),
@@ -3295,6 +3409,30 @@ function normalizeConfig(rawConfig) {
     maxLoopTakes: Math.max(1, clampToNonNegativeInt(swapInput.maxLoopTakes, 100)),
     maxRuntimeMinutes: clampToNonNegativeInt(swapInput.maxRuntimeMinutes, 0),
     allowedPairs: rawAllowedPairs.map((p) => String(p || "").trim().toLowerCase()).filter(Boolean),
+    maker: {
+      minBps: Number.isFinite(Number(makerInput.minBps)) ? Number(makerInput.minBps) : 10,
+      maxBps: Number.isFinite(Number(makerInput.maxBps)) ? Number(makerInput.maxBps) : 100,
+      expiresHours: Math.max(1, clampToNonNegativeInt(makerInput.expiresHours, 6)),
+      maxOpenOrders: Math.max(1, clampToNonNegativeInt(makerInput.maxOpenOrders, 3)),
+      rateLimitCooldownMinutes: Math.max(1, clampToNonNegativeInt(makerInput.rateLimitCooldownMinutes, 60)),
+      balanceLockCooldownSeconds: Math.max(10, clampToNonNegativeInt(makerInput.balanceLockCooldownSeconds, 120)),
+      takerIdleSecondsBeforeMaker: Math.max(1, clampToNonNegativeInt(makerInput.takerIdleSecondsBeforeMaker, 10)),
+      cancelAfterIdleMinutes: Math.max(1, clampToNonNegativeInt(makerInput.cancelAfterIdleMinutes, 5))
+    },
+    taker: {
+      minBps: Number.isFinite(Number(takerInput.minBps)) ? Number(takerInput.minBps) : 25,
+      // Hard cap per maker username; resets every Saturday 00:00 UTC (Sat 07:00 WIB).
+      // Falls back to the legacy `maxTakesPerCounterpartyPerHour` key if present.
+      maxTakesPerCounterpartyPerWeek: Math.max(0, clampToNonNegativeInt(
+        takerInput.maxTakesPerCounterpartyPerWeek
+        ?? takerInput.maxTakesPerCounterpartyPerHour,
+        5
+      )),
+      balanceLockCooldownSeconds: Math.max(10, clampToNonNegativeInt(takerInput.balanceLockCooldownSeconds, 90)),
+      orderBlacklistSeconds: Math.max(10, clampToNonNegativeInt(takerInput.orderBlacklistSeconds, 60)),
+      maxDrainPerLoop: Math.max(1, clampToNonNegativeInt(takerInput.maxDrainPerLoop, 10)),
+      fastScanIntervalSeconds: Math.max(1, clampToNonNegativeInt(takerInput.fastScanIntervalSeconds, 2))
+    },
     ring: {
       enabled: ringInput.enabled !== false,
       selfListEdgeBps: Number.isFinite(Number(ringInput.selfListEdgeBps)) ? Number(ringInput.selfListEdgeBps) : 0,
@@ -3891,8 +4029,8 @@ function isTrafficCongestionError(error) {
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
-const TWOCAPTCHA_IN_URL = "https://api.multibot.cloud/in.php";
-const TWOCAPTCHA_RES_URL = "https://api.multibot.cloud/res.php";
+const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
+const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
@@ -4827,6 +4965,14 @@ class RootsFiApiClient {
     });
   }
 
+  async getAccountRewards() {
+    return this.requestJson("GET", this.paths.accountRewards, {
+      refererPath: "/cross-otc",
+      timeoutMs: 15000,
+      skipInfiniteTimeoutRetry: true
+    });
+  }
+
   async reserveOtcOrder(orderId) {
     return this.requestJson("POST", `${this.paths.crossOtcOrders}/${encodeURIComponent(orderId)}/reserve`, {
       refererPath: "/cross-otc",
@@ -4870,6 +5016,7 @@ function printBalanceSummary(data) {
   const wallets = isObject(data.wallets) ? data.wallets : {};
 
   const ethereum = isObject(balances.ethereum) ? balances.ethereum : {};
+  const base = isObject(balances.base) ? balances.base : {};
   const canton = isObject(balances.canton) ? balances.canton : {};
 
   const holdingsBySymbol = new Map();
@@ -4910,9 +5057,9 @@ function printBalanceSummary(data) {
   const ccBalance = holdingsBySymbol.get("CC") || "0";
   const cbtcBalance = holdingsBySymbol.get("CBTC") || "0";
 
-  console.log("[balance] Ethereum");
-  console.log(`  ETH: ${ethereum.eth ?? "n/a"}`);
-  console.log(`  USDC: ${ethereum.usdc ?? "n/a"}`);
+  console.log("[balance] Base (L2)");
+  console.log(`  USDC: ${base.usdc ?? ethereum.usdc ?? "n/a"}`);
+  console.log(`  ETH: ${base.eth ?? ethereum.eth ?? "n/a"}`);
 
   console.log("[balance] Canton");
   console.log(`  USDCx: ${canton.usdcx ?? "n/a"}`);
@@ -4931,12 +5078,14 @@ function printBalanceSummary(data) {
   console.log(`  cantonPartyId: ${wallets.cantonPartyId ?? "n/a"}`);
 
   return {
-    eth: String(ethereum.eth ?? "n/a"),
-    usdc: String(ethereum.usdc ?? "n/a"),
+    eth: String(base.eth ?? ethereum.eth ?? "n/a"),
+    usdc: String(base.usdc ?? ethereum.usdc ?? "n/a"),
+    usdcBase: String(base.usdc ?? "0"),
     usdcx: String(canton.usdcx ?? "n/a"),
     cc: String(ccBalance ?? "0"),
     cbtc: String(cbtcBalance ?? "0"),
     ccNumeric: Number(ccBalance) || 0,
+    usdcBaseNumeric: Number(base.usdc) || 0,
     available: canton.available === true || canton.available === "true",
     cantonPartyId: String(wallets.cantonPartyId ?? "n/a")
   };
@@ -5702,12 +5851,12 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 
     if (currentBalance !== null) {
       dashboard.setState({
-        balance: `CC=${currentBalance.cc} | USDCx=${currentBalance.usdcx} | CBTC=${currentBalance.cbtc}`
+        balance: `CC=${currentBalance.cc} | USDC=${currentBalance.usdcBase} | CBTC=${currentBalance.cbtc}`
       });
 
       console.log(`[info] Current balance: CC=${currentBalance.cc} (${currentBalance.ccNumeric}) | Available=${currentBalance.available}`);
       updateAccountCcBalance(senderAccountName, currentBalance.ccNumeric);
-      updateAccountUsdcxBalance(senderAccountName, Number(currentBalance.usdcx) || 0);
+      updateAccountUsdcBalance(senderAccountName, Number(currentBalance.usdcBase) || 0);
 
       // Check if balance is sufficient (use ccNumeric for comparison)
       const requiredAmount = Number(sendRequest.amount);
@@ -6266,7 +6415,7 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
   const postSendBalance = await getBalanceWithTimeout(client);
   if (postSendBalance !== null) {
     dashboard.setState({
-      balance: `CC=${postSendBalance.cc} | USDCx=${postSendBalance.usdcx} | CBTC=${postSendBalance.cbtc}`,
+      balance: `CC=${postSendBalance.cc} | USDC=${postSendBalance.usdcBase} | CBTC=${postSendBalance.cbtc}`,
       swapsTotal: `${Math.min(expectedTxCount, completedTx + skippedTx)}/${expectedTxCount}`,
       swapsOk: String(completedTx),
       swapsFail: String(skippedTx),
@@ -6274,7 +6423,7 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
     });
     console.log(`[info] Final balance: CC=${postSendBalance.cc} | Available=${postSendBalance.available}`);
     updateAccountCcBalance(senderAccountName, postSendBalance.ccNumeric);
-    updateAccountUsdcxBalance(senderAccountName, Number(postSendBalance.usdcx) || 0);
+    updateAccountUsdcBalance(senderAccountName, Number(postSendBalance.usdcBase) || 0);
   } else {
     console.log(`[warn] Final balance check timeout/failed`);
     dashboard.setState({
@@ -7351,10 +7500,10 @@ async function processAccount(context) {
       if (sessionReuse.ok) {
         const balance = printBalanceSummary(sessionReuse.balancesData);
         dashboard.setState({
-          balance: `CC=${balance.cc} | USDCx=${balance.usdcx} | CBTC=${balance.cbtc}`
+          balance: `CC=${balance.cc} | USDC=${balance.usdcBase} | CBTC=${balance.cbtc}`
         });
         updateAccountCcBalance(account.name, balance.ccNumeric);
-        updateAccountUsdcxBalance(account.name, Number(balance.usdcx) || 0);
+        updateAccountUsdcBalance(account.name, Number(balance.usdcBase) || 0);
         recordInitialCcBalance(account.name, balance.ccNumeric);
 
         // Auto-accept pending offers (non-blocking, run before rewards check)
@@ -7690,10 +7839,10 @@ async function processAccount(context) {
     const balancesResponse = await client.getBalances();
     const balance = printBalanceSummary(balancesResponse && balancesResponse.data ? balancesResponse.data : {});
     dashboard.setState({
-      balance: `CC=${balance.cc} | USDCx=${balance.usdcx} | CBTC=${balance.cbtc}`
+      balance: `CC=${balance.cc} | USDC=${balance.usdcBase} | CBTC=${balance.cbtc}`
     });
     updateAccountCcBalance(account.name, balance.ccNumeric);
-    updateAccountUsdcxBalance(account.name, Number(balance.usdcx) || 0);
+    updateAccountUsdcBalance(account.name, Number(balance.usdcBase) || 0);
     recordInitialCcBalance(account.name, balance.ccNumeric);
 
     // Auto-accept pending offers (non-blocking, run before rewards check)
@@ -8528,11 +8677,12 @@ function otcGetAccountBalance(asset, balanceData) {
   const sym = String(asset || "").toUpperCase();
   const balances = isObject(balanceData.balances) ? balanceData.balances : {};
   const canton = isObject(balances.canton) ? balances.canton : {};
+  const base = isObject(balances.base) ? balances.base : {};
   const ethereum = isObject(balances.ethereum) ? balances.ethereum : {};
 
   if (sym === "USDCX") return Number(canton.usdcx) || 0;
-  if (sym === "USDC") return Number(ethereum.usdc) || 0;
-  if (sym === "ETH") return Number(ethereum.eth) || 0;
+  if (sym === "USDC") return Number(base.usdc) || Number(ethereum.usdc) || 0;
+  if (sym === "ETH") return Number(base.eth) || Number(ethereum.eth) || 0;
 
   // For CC + tokens lain, walk Canton tokenHoldings + otherHoldings
   const lists = [];
@@ -8566,13 +8716,42 @@ function computeOtcOrderEdge(order, mids) {
   };
 }
 
-function isOtcOrderProfitable(order, mids, balanceData, selfProfileId, swapCfg, nowMs) {
+function isOtcOrderProfitable(order, mids, balanceData, selfProfileId, swapCfg, nowMs, ctx) {
   if (!isObject(order)) return { ok: false, reason: "no-order" };
+
+  // Skip orders that just returned 409 (already reserved/closed)
+  if (order.id && isOtcOrderBlacklisted(order.id)) {
+    return { ok: false, reason: "blacklisted" };
+  }
 
   // Skip own orders (anti-circular)
   const makerId = String(order.makerProfileId || "");
   if (selfProfileId && makerId && makerId === String(selfProfileId)) {
     return { ok: false, reason: "self-order" };
+  }
+
+  // Skip own orders by username (public listing now exposes makerUsername)
+  const makerUsername = normalizeOtcUsername(order.makerUsername);
+  const ownUsernames = isObject(ctx) && ctx.ownUsernames instanceof Set ? ctx.ownUsernames : null;
+  if (makerUsername && ownUsernames && ownUsernames.has(makerUsername)) {
+    return { ok: false, reason: "self-username" };
+  }
+
+  // Per-counterparty take limit. Resets every Saturday 00:00 UTC (Sat 07:00 WIB),
+  // aligned with Roots' rewards weekly snapshot to avoid the "repetitive_otc_swaps" penalty.
+  const takerCfg = isObject(swapCfg.taker) ? swapCfg.taker : {};
+  const maxPerCounterparty = Number(takerCfg.maxTakesPerCounterpartyPerWeek)
+    || Number(takerCfg.maxTakesPerCounterpartyPerHour) || 0;
+  if (makerUsername && maxPerCounterparty > 0) {
+    const recent = pruneOtcCounterpartyHistory(makerUsername, nowMs);
+    if (recent.length >= maxPerCounterparty) {
+      const resetMs = getNextCounterpartyResetMs(nowMs);
+      const hoursToReset = Math.max(0, (resetMs - nowMs) / 3_600_000);
+      return {
+        ok: false,
+        reason: `counterparty-limit (${recent.length}/${maxPerCounterparty} from ${makerUsername}, resets in ${hoursToReset.toFixed(1)}h)`
+      };
+    }
   }
 
   // Skip reserved
@@ -8630,12 +8809,12 @@ function isOtcOrderProfitable(order, mids, balanceData, selfProfileId, swapCfg, 
   return { ok: true, reason: "profitable", edge };
 }
 
-function pickBestOtcOrder(orders, mids, balanceData, selfProfileId, swapCfg) {
+function pickBestOtcOrder(orders, mids, balanceData, selfProfileId, swapCfg, ctx) {
   if (!Array.isArray(orders) || orders.length === 0) return null;
   const nowMs = Date.now();
   const candidates = [];
   for (const order of orders) {
-    const verdict = isOtcOrderProfitable(order, mids, balanceData, selfProfileId, swapCfg, nowMs);
+    const verdict = isOtcOrderProfitable(order, mids, balanceData, selfProfileId, swapCfg, nowMs, ctx);
     if (verdict.ok) {
       candidates.push({ order, edge: verdict.edge });
     }
@@ -8659,37 +8838,153 @@ function getSelfProfileIdFromBalance(balanceData) {
   return null;
 }
 
+// =============================================================================
+// OTC Dashboard wrapper — match the Send-mode pinned dashboard UI for OTC flows
+// =============================================================================
+
+function attachOtcDashboard(context, modeLabel) {
+  const config = context.config || {};
+  const args = context.args || {};
+  const accountList = (context.accounts && Array.isArray(context.accounts.accounts))
+    ? context.accounts.accounts
+    : [];
+  const uiCfg = isObject(config.ui) ? config.ui : {};
+  const swapCfg = isObject(config.swap) ? config.swap : {};
+
+  const accountSnapshots = {};
+  for (const acc of accountList) {
+    accountSnapshots[acc.name] = { status: "QUEUE", cc: "-", usdc: "-", eth: "-", mk: 0, tk: 0, pts: "-", pen: 0 };
+  }
+
+  const dashboard = new PinnedDashboard({
+    enabled:
+      uiCfg.dashboard !== false &&
+      !args.noDashboard &&
+      process.env.ROOTSFI_NO_DASHBOARD !== "1",
+    logLines: uiCfg.logLines,
+    accountSnapshots
+  });
+
+  const accountsState = accountList
+    .map((acc, idx) => `${idx === 0 ? "*" : ""}${acc.name}(QUEUE)`)
+    .join(" | ");
+
+  dashboard.setState({
+    phase: "init",
+    mode: String(modeLabel || "OTC").toUpperCase(),
+    selectedAccount: accountList.length > 0
+      ? `[1/${accountList.length}] ${accountList[0].name} (${maskEmail(accountList[0].email)})`
+      : "-",
+    accounts: accountsState,
+    minDelay: clampToNonNegativeInt(swapCfg.minDelaySeconds, 5),
+    maxDelay: clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
+  });
+  dashboard.attach();
+  setActiveDashboard(dashboard);
+  return dashboard;
+}
+
+function updateOtcAccountSnapshot(dashboard, accountName, patch) {
+  if (!dashboard || !accountName || !isObject(dashboard.accountSnapshots)) return;
+  const prev = isObject(dashboard.accountSnapshots[accountName])
+    ? dashboard.accountSnapshots[accountName]
+    : {};
+  dashboard.accountSnapshots[accountName] = { ...prev, ...patch };
+  if (typeof dashboard._scheduleRender === "function") {
+    dashboard._scheduleRender();
+  }
+}
+
+function detachOtcDashboard(dashboard) {
+  if (!dashboard) return;
+  try { if (typeof dashboard.detach === "function") dashboard.detach(); } catch (_) { }
+  try { setActiveDashboard(null); } catch (_) { }
+}
+
+async function refreshOtcAccountPoints(client, dashboard, accountName, tag) {
+  try {
+    const resp = await client.getAccountRewards();
+    const data = isObject(resp && resp.data) ? resp.data : {};
+    const totalPoints = Number(data.totalPoints);
+    const penalties = Array.isArray(data.penalties) ? data.penalties : [];
+    const totalPen = penalties.reduce((sum, p) => sum + (Number(p && p.penalty) || 0), 0);
+    if (Number.isFinite(totalPoints)) {
+      updateOtcAccountSnapshot(dashboard, accountName, { pts: totalPoints, pen: totalPen });
+      const earned = Number(data.earnedPoints);
+      console.log(`${tag} [pts] totalPoints=${totalPoints}${Number.isFinite(earned) ? ` earned=${earned}` : ""}${totalPen > 0 ? ` penalties=-${totalPen}` : ""}`);
+    } else {
+      // No totalPoints field — still update penalty snapshot if available
+      updateOtcAccountSnapshot(dashboard, accountName, { pen: totalPen });
+    }
+  } catch (error) {
+    // non-fatal — endpoint may 404 or rate-limit
+  }
+}
+
+function formatOtcCcUsdc(balanceData) {
+  const cc = otcGetAccountBalance("CC", balanceData);
+  const usdc = otcGetAccountBalance("USDC", balanceData);
+  const eth = otcGetAccountBalance("ETH", balanceData);
+  const fmt = (n) => {
+    const v = Number(n) || 0;
+    if (v >= 1000) return v.toFixed(0);
+    if (v >= 100) return v.toFixed(1);
+    return v.toFixed(2);
+  };
+  const fmtEth = (n) => {
+    const v = Number(n) || 0;
+    if (v >= 1) return v.toFixed(3);
+    if (v >= 0.001) return v.toFixed(4);
+    if (v > 0) return v.toFixed(5);
+    return "0";
+  };
+  return { cc: fmt(cc), usdc: fmt(usdc), eth: fmtEth(eth) };
+}
+
 async function runOtcAccountWorker(account, context, statsBucket) {
-  const { config, tokens } = context;
+  const { config, tokens, accounts, dashboard } = context;
   const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
   tokens.accounts[account.name] = accountToken;
   const accountConfig = cloneRuntimeConfig(config);
   applyTokenProfileToConfig(accountConfig, accountToken);
   const accountLogTag = `[${account.name}]`;
   const swapCfg = config.swap;
+  const ownUsernames = new Set(
+    (Array.isArray(accounts && accounts.accounts) ? accounts.accounts : [])
+      .map((a) => normalizeOtcUsername(a && a.name))
+      .filter(Boolean)
+  );
+  const pickerCtx = { ownUsernames };
 
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "SESS" });
   const client = new RootsFiApiClient(accountConfig);
 
   // Session reuse (OTC mode requires existing session; OTP login not handled here)
   if (!client.hasAccountSessionCookie()) {
     console.log(`${accountLogTag} [otc] No session cookie — run OTP mode first`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "NOSESS" });
     return { account: account.name, ok: false, error: "no-session" };
   }
   let sessionReuse = null;
   try {
-    sessionReuse = await attemptSessionReuse(client, accountConfig, () => {}, accountLogTag);
+    sessionReuse = await attemptSessionReuse(client, accountConfig, () => { }, accountLogTag);
   } catch (error) {
     console.log(`${accountLogTag} [otc] Session reuse threw: ${error.message}`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
     return { account: account.name, ok: false, error: error.message };
   }
   if (!sessionReuse || !sessionReuse.ok) {
     const reason = sessionReuse && sessionReuse.error ? sessionReuse.error.message : "unknown";
     console.log(`${accountLogTag} [otc] Session not reusable: ${reason}`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
     return { account: account.name, ok: false, error: "session-not-ok" };
   }
 
   let balanceData = sessionReuse.balancesData;
   const selfProfileId = getSelfProfileIdFromBalance(balanceData);
+  const initBal = formatOtcCcUsdc(balanceData);
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  await refreshOtcAccountPoints(client, dashboard, account.name, accountLogTag);
   console.log(`${accountLogTag} [otc] Profile=${selfProfileId || "?"} — start scanning orders`);
 
   const maxLoop = Number(swapCfg.maxLoopTakes) || 100;
@@ -8698,12 +8993,29 @@ async function runOtcAccountWorker(account, context, statsBucket) {
   let takesOk = 0;
   let takesFail = 0;
   let scans = 0;
+  let takerBalanceLockUntil = 0;
+  let localTakeCount = 0;
+  const pointsRefreshEvery = 5; // refresh pts every N successful takes
 
   while (takesOk < maxLoop) {
     if (maxRuntimeMs > 0 && Date.now() - startMs > maxRuntimeMs) {
       console.log(`${accountLogTag} [otc] Max runtime reached, stop`);
       break;
     }
+
+    // Honor balance-lock cooldown (server says pending sends/open swaps eat available balance)
+    if (Date.now() < takerBalanceLockUntil) {
+      const remainSec = Math.ceil((takerBalanceLockUntil - Date.now()) / 1000);
+      if (scans % 5 === 0) {
+        console.log(`${accountLogTag} [otc] ⏸ Balance-lock cooldown ${remainSec}s (waiting for pending settlement)`);
+      }
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "LOCK" });
+      await sleep(Math.min(15000, remainSec * 1000));
+      scans += 1;
+      continue;
+    }
+
+    pruneOtcOrderBlacklist();
     scans += 1;
 
     let orders = [];
@@ -8736,74 +9048,146 @@ async function runOtcAccountWorker(account, context, statsBucket) {
       continue;
     }
 
-    const pick = pickBestOtcOrder(orders, mids, balanceData, selfProfileId, swapCfg);
-    if (!pick) {
-      // No profitable order — sleep & retry
-      const idleSec = humanLikeDelay(
-        clampToNonNegativeInt(swapCfg.minDelaySeconds, 30),
-        clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
+    const takerCfg = isObject(swapCfg.taker) ? swapCfg.taker : {};
+    const takerSwapCfg = { ...swapCfg, minEdgeBps: Number(takerCfg.minBps) ?? 25 };
+    const blacklistTtlMs = (Number(takerCfg.orderBlacklistSeconds) || 60) * 1000;
+    const maxDrainPerLoop = Math.max(1, clampToNonNegativeInt(takerCfg.maxDrainPerLoop, 10));
+
+    // ═══════════════════════════════════════════════════
+    // DRAIN — keep taking while balance allows.
+    //   Counterparty per-hour limit + self-username skip are enforced
+    //   inside isOtcOrderProfitable (preserved automatically).
+    // ═══════════════════════════════════════════════════
+    let drainCount = 0;
+    let breakDrain = false;
+
+    while (takesOk < maxLoop && drainCount < maxDrainPerLoop && !breakDrain) {
+      const pick = pickBestOtcOrder(orders, mids, balanceData, selfProfileId, takerSwapCfg, pickerCtx);
+      if (!pick) break;
+
+      const { order, edge } = pick;
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "TAKE" });
+      console.log(
+        `${accountLogTag} [otc] PICK ${order.id.slice(0, 8)} ${order.side} ` +
+        `pays=${order.dstAmountDecimal} ${order.dstAsset} recv=${order.srcAmountDecimal} ${order.srcAsset} ` +
+        `edge=${edge.edgeBps.toFixed(1)}bps (~$${edge.estProfitUsd.toFixed(4)}) ` +
+        `[drain ${drainCount + 1}/${maxDrainPerLoop}]`
       );
-      if (scans % 5 === 1) {
-        console.log(`${accountLogTag} [otc] No profitable order (scanned ${orders.length}, sleep ${idleSec}s)`);
+
+      // Reserve
+      let reserveOk = false;
+      try {
+        await client.reserveOtcOrder(order.id);
+        reserveOk = true;
+      } catch (error) {
+        const errMsg = String(error.message || "");
+        if (isOtcOrderClosedError(errMsg)) {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${accountLogTag} [otc] Reserve race ${order.id.slice(0, 8)} (409) — blacklist, try next`);
+        } else {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${accountLogTag} [otc] Reserve failed for ${order.id.slice(0, 8)}: ${errMsg}`);
+        }
+        takesFail += 1;
+        statsBucket.reserveFail += 1;
       }
+
+      if (!reserveOk) {
+        drainCount++;
+        continue;
+      }
+
+      // Take
+      let takeOk = false;
+      try {
+        const takeResult = await client.takeOtcOrder(order.id);
+        const filled = isObject(takeResult && takeResult.data && takeResult.data.order)
+          ? takeResult.data.order
+          : null;
+        const status = filled ? filled.status : "?";
+        const makerUsername = normalizeOtcUsername(order.makerUsername);
+        if (makerUsername) {
+          recordOtcCounterpartyTake(makerUsername);
+          const cnt = pruneOtcCounterpartyHistory(makerUsername, Date.now()).length;
+          const limit = Number(takerCfg.maxTakesPerCounterpartyPerWeek)
+            || Number(takerCfg.maxTakesPerCounterpartyPerHour) || 0;
+          console.log(
+            `${accountLogTag} [otc] TAKE ok ${order.id.slice(0, 8)} status=${status} ` +
+            `maker=${order.makerUsername} (${cnt}${limit > 0 ? `/${limit}` : ""}/wk)`
+          );
+        } else {
+          console.log(`${accountLogTag} [otc] TAKE ok ${order.id.slice(0, 8)} status=${status}`);
+        }
+        takesOk += 1;
+        statsBucket.takeOk += 1;
+        statsBucket.profitUsd += edge.estProfitUsd;
+        statsBucket.volumeUsd += edge.takerPaysUsd;
+        blacklistOtcOrder(order.id, blacklistTtlMs); // skip in cached `orders` array
+        takeOk = true;
+        localTakeCount += 1;
+        updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
+        if (localTakeCount % pointsRefreshEvery === 0) {
+          await refreshOtcAccountPoints(client, dashboard, account.name, accountLogTag);
+        }
+      } catch (error) {
+        const errMsg = String(error.message || "");
+        if (isOtcOrderClosedError(errMsg)) {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${accountLogTag} [otc] Take race ${order.id.slice(0, 8)} (409) — blacklist, try next`);
+        } else if (isOtcBalanceLockError(errMsg)) {
+          const lockSec = Number(takerCfg.balanceLockCooldownSeconds) || 90;
+          takerBalanceLockUntil = Date.now() + lockSec * 1000;
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${accountLogTag} [otc] ⚠ Balance lock on take ${order.id.slice(0, 8)} — pause ${lockSec}s, end drain`);
+          breakDrain = true;
+        } else {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${accountLogTag} [otc] Take failed for ${order.id.slice(0, 8)}: ${errMsg}`);
+        }
+        takesFail += 1;
+        statsBucket.takeFail += 1;
+      }
+
+      drainCount++;
+
+      if (takeOk) {
+        // Refresh balance immediately so next pick filters by post-take saldo
+        try {
+          const balResp = await client.getBalances();
+          if (isObject(balResp && balResp.data)) {
+            balanceData = balResp.data;
+            const bal = formatOtcCcUsdc(balanceData);
+            updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+          }
+        } catch (_) { }
+      }
+    }
+
+    if (drainCount === 0) {
+      // No profitable order — fast re-scan to honor "wajib ambil" rule on new orders
+      const idleSec = Math.max(1, Number(takerCfg.fastScanIntervalSeconds) || 2);
+      if (scans % 10 === 1) {
+        console.log(`${accountLogTag} [otc] No profitable order (scanned ${orders.length}, fast-scan ${idleSec}s)`);
+      }
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE" });
       await sleep(idleSec * 1000);
       continue;
     }
 
-    const { order, edge } = pick;
-    console.log(
-      `${accountLogTag} [otc] PICK ${order.id.slice(0, 8)} ${order.side} ` +
-      `pays=${order.dstAmountDecimal} ${order.dstAsset} recv=${order.srcAmountDecimal} ${order.srcAsset} ` +
-      `edge=${edge.edgeBps.toFixed(1)}bps (~$${edge.estProfitUsd.toFixed(4)})`
-    );
-
-    // Reserve
-    try {
-      await client.reserveOtcOrder(order.id);
-    } catch (error) {
-      console.log(`${accountLogTag} [otc] Reserve failed for ${order.id.slice(0, 8)}: ${error.message}`);
-      takesFail += 1;
-      statsBucket.reserveFail += 1;
-      await sleep(2000);
-      continue;
-    }
-
-    // Take (commit even if oracle drifts — user choice)
-    try {
-      const takeResult = await client.takeOtcOrder(order.id);
-      const filled = isObject(takeResult && takeResult.data && takeResult.data.order)
-        ? takeResult.data.order
-        : null;
-      const status = filled ? filled.status : "?";
-      console.log(`${accountLogTag} [otc] TAKE ok ${order.id.slice(0, 8)} status=${status}`);
-      takesOk += 1;
-      statsBucket.takeOk += 1;
-      statsBucket.profitUsd += edge.estProfitUsd;
-      statsBucket.volumeUsd += edge.takerPaysUsd;
-    } catch (error) {
-      console.log(`${accountLogTag} [otc] Take failed for ${order.id.slice(0, 8)}: ${error.message}`);
-      takesFail += 1;
-      statsBucket.takeFail += 1;
-    }
-
-    // Refresh balance for next iteration's filter accuracy
-    try {
-      const balResp = await client.getBalances();
-      if (isObject(balResp && balResp.data)) {
-        balanceData = balResp.data;
-      }
-    } catch (error) {
-      // non-fatal
+    if (drainCount > 1) {
+      console.log(`${accountLogTag} [otc] drain complete: ${drainCount} attempts this loop`);
     }
 
     const cooldown = humanLikeDelay(
       clampToNonNegativeInt(swapCfg.minDelaySeconds, 30),
       clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
     );
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "COOL" });
     console.log(`${accountLogTag} [otc] cooldown ${cooldown}s before next scan`);
     await sleep(cooldown * 1000);
   }
 
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "DONE" });
   return { account: account.name, ok: true, takesOk, takesFail, scans };
 }
 
@@ -8821,9 +9205,13 @@ async function runOtcTradingFlow(context) {
     return;
   }
 
+  const takerBpsBanner = isObject(swapCfg.taker) ? (Number(swapCfg.taker.minBps) || 25) : 25;
+  const dashboard = attachOtcDashboard(context, "OTC-TAKER");
+  context.dashboard = dashboard;
+
   console.log(`\n${"#".repeat(70)}`);
-  console.log(`[otc] Take-only OTC trading start`);
-  console.log(`[otc] Accounts=${selectedAccounts.length} | minEdge=${swapCfg.minEdgeBps}bps | maxOrder=$${swapCfg.maxOrderSizeUsd}`);
+  console.log(`[otc] Taker-only OTC trading — take orders at ≥${takerBpsBanner}bps`);
+  console.log(`[otc] Accounts=${selectedAccounts.length} | minEdge=${takerBpsBanner}bps | maxOrder=$${swapCfg.maxOrderSizeUsd}`);
   console.log(`[otc] Workers=${swapCfg.workers} | maxTakes/akun=${swapCfg.maxLoopTakes}`);
   console.log(`${"#".repeat(70)}\n`);
 
@@ -8849,25 +9237,887 @@ async function runOtcTradingFlow(context) {
     }
   };
 
-  launchNext();
-  while (inFlight.length > 0) {
-    await Promise.race(inFlight);
+  try {
     launchNext();
-  }
+    while (inFlight.length > 0) {
+      await Promise.race(inFlight);
+      launchNext();
+    }
 
-  console.log(`\n${"#".repeat(70)}`);
-  console.log(`[otc] Done — takes ok=${statsBucket.takeOk} fail=${statsBucket.takeFail} | volume=$${statsBucket.volumeUsd.toFixed(2)} | est profit=$${statsBucket.profitUsd.toFixed(4)}`);
-  console.log(`${"#".repeat(70)}\n`);
+    console.log(`\n${"#".repeat(70)}`);
+    console.log(`[otc] Done — takes ok=${statsBucket.takeOk} fail=${statsBucket.takeFail} | volume=$${statsBucket.volumeUsd.toFixed(2)} | est profit=$${statsBucket.profitUsd.toFixed(4)}`);
+    console.log(`${"#".repeat(70)}\n`);
+  } finally {
+    detachOtcDashboard(dashboard);
+    context.dashboard = null;
+  }
 }
 
 // =============================================================================
-// OTC Ring-Hybrid (self-listing antar akun + camouflage external take)
+// OTC Maker Flow — create listings (sell CC for USDC)
+// =============================================================================
+
+async function runOtcMakerAccountWorker(account, context, statsBucket) {
+  const { config, tokens, dashboard } = context;
+  const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+  tokens.accounts[account.name] = accountToken;
+  const accountConfig = cloneRuntimeConfig(config);
+  applyTokenProfileToConfig(accountConfig, accountToken);
+  const tag = `[${account.name}]`;
+  const swapCfg = isObject(config.swap) ? config.swap : {};
+  const makerCfg = isObject(swapCfg.maker) ? swapCfg.maker : {};
+
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "SESS" });
+  const client = new RootsFiApiClient(accountConfig);
+
+  if (!client.hasAccountSessionCookie()) {
+    console.log(`${tag} [maker] No session cookie — run OTP mode first`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "NOSESS" });
+    return { account: account.name, ok: false, error: "no-session" };
+  }
+
+  let sessionReuse = null;
+  try {
+    sessionReuse = await attemptSessionReuse(client, accountConfig, () => { }, tag);
+  } catch (error) {
+    console.log(`${tag} [maker] Session reuse failed: ${error.message}`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
+    return { account: account.name, ok: false, error: error.message };
+  }
+  if (!sessionReuse || !sessionReuse.ok) {
+    console.log(`${tag} [maker] Session not reusable`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
+    return { account: account.name, ok: false, error: "session-not-ok" };
+  }
+
+  let balanceData = sessionReuse.balancesData;
+  const selfProfileId = getSelfProfileIdFromBalance(balanceData);
+  const initBal = formatOtcCcUsdc(balanceData);
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  await refreshOtcAccountPoints(client, dashboard, account.name, tag);
+  console.log(`${tag} [maker] Profile=${selfProfileId || "?"} — start creating listings`);
+
+  const minBps = Number.isFinite(makerCfg.minBps) ? makerCfg.minBps : 10;
+  const maxBps = Number.isFinite(makerCfg.maxBps) ? makerCfg.maxBps : 100;
+  const expiresHours = Number(makerCfg.expiresHours) || 6;
+  const maxOpenOrders = Number(makerCfg.maxOpenOrders) || 3;
+  const rateLimitCooldownMs = (Number(makerCfg.rateLimitCooldownMinutes) || 60) * 60 * 1000;
+  const maxLoop = Number(swapCfg.maxLoopTakes) || 100;
+  let ordersCreated = 0;
+  let makerCooldownUntil = 0; // timestamp when maker can resume
+  let makerBalanceLockUntil = 0; // pause when create returns "balance below listed amount"
+
+  for (let loop = 0; loop < maxLoop; loop++) {
+    // Check if in maker cooldown (rate limited)
+    if (Date.now() < makerCooldownUntil) {
+      const remainMin = Math.ceil((makerCooldownUntil - Date.now()) / 60000);
+      if (loop % 10 === 0) {
+        console.log(`${tag} [maker] ⏸ Rate limit cooldown — ${remainMin}min remaining`);
+      }
+      await sleep(30000);
+      continue;
+    }
+
+    // Balance-lock cooldown — wait for pending settlement
+    if (Date.now() < makerBalanceLockUntil) {
+      const remainSec = Math.ceil((makerBalanceLockUntil - Date.now()) / 1000);
+      if (loop % 5 === 0) {
+        console.log(`${tag} [maker] ⏸ Balance-lock cooldown ${remainSec}s (waiting settlement)`);
+      }
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "LOCK" });
+      await sleep(Math.min(15000, remainSec * 1000));
+      continue;
+    }
+
+    // Check how many open orders we have
+    let myOrders = [];
+    let mids = {};
+    try {
+      const [ordersRes, mineRes, refRes] = await Promise.all([
+        client.getCrossOtcOrders(false),
+        client.getCrossOtcOrders(true),
+        client.getCrossOtcReference()
+      ]);
+      myOrders = Array.isArray(mineRes && mineRes.data && mineRes.data.orders)
+        ? mineRes.data.orders
+        : (Array.isArray(mineRes && mineRes.data) ? mineRes.data : []);
+      const refData = isObject(refRes && refRes.data) ? refRes.data : {};
+      mids = isObject(refData.mids) ? refData.mids : {};
+    } catch (error) {
+      console.log(`${tag} [maker] Fetch failed: ${error.message}`);
+      await sleep(15000);
+      continue;
+    }
+
+    // Count open orders and calculate locked balance per asset
+    let openOrders = myOrders.filter(o => o.status === "open");
+
+    // Cancel listings that have been waiting for taker too long
+    {
+      const nowMs = Date.now();
+      const cancelAfterIdleMs = Math.max(60_000, (Number(makerCfg.cancelAfterIdleMinutes) || 5) * 60_000);
+      const survivors = [];
+      for (const myOrder of openOrders) {
+        if (myOrder.reservedByProfileId) {
+          // Currently reserved — let settlement proceed
+          survivors.push(myOrder);
+          continue;
+        }
+        const createdMs = Date.parse(myOrder.createdAt || "");
+        if (!Number.isFinite(createdMs)) {
+          survivors.push(myOrder);
+          continue;
+        }
+        const elapsedMs = nowMs - createdMs;
+        if (elapsedMs >= cancelAfterIdleMs) {
+          try {
+            await client.cancelOtcOrder(myOrder.id);
+            console.log(`${tag} [maker] ♻ Cancelled ${myOrder.id.slice(0, 8)} (idle ${(elapsedMs / 60000).toFixed(1)}min ≥ ${(cancelAfterIdleMs / 60000).toFixed(0)}min threshold)`);
+            statsBucket.ordersCancelled = (statsBucket.ordersCancelled || 0) + 1;
+            continue; // exclude from survivors
+          } catch (_) {
+            survivors.push(myOrder); // failed to cancel — keep
+          }
+        } else {
+          survivors.push(myOrder);
+        }
+      }
+      openOrders = survivors;
+    }
+
+    let lockedCc = 0;
+    let lockedUsdc = 0;
+    for (const o of openOrders) {
+      const src = Number(o.srcAmountDecimal) || 0;
+      const srcAsset = String(o.srcAsset || "").toUpperCase();
+      if (srcAsset === "CC") lockedCc += src;
+      else if (srcAsset === "USDC") lockedUsdc += src;
+    }
+
+    if (openOrders.length >= maxOpenOrders) {
+      const idleSec = humanLikeDelay(
+        clampToNonNegativeInt(swapCfg.minDelaySeconds, 30),
+        clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
+      );
+      if (loop % 3 === 0) {
+        console.log(`${tag} [maker] ${openOrders.length}/${maxOpenOrders} open (locked CC=${lockedCc.toFixed(2)} USDC=${lockedUsdc.toFixed(2)}), wait ${idleSec}s`);
+      }
+      await sleep(idleSec * 1000);
+      continue;
+    }
+
+    // Available = total balance - locked in open orders
+    const ccBalance = otcGetAccountBalance("CC", balanceData);
+    const usdcBalance = otcGetAccountBalance("USDC", balanceData);
+    const availCc = Math.max(0, ccBalance - lockedCc);
+    const availUsdc = Math.max(0, usdcBalance - lockedUsdc);
+    const minUsd = Number(swapCfg.minOrderSizeUsd) || 1.05;
+    const maxUsd = Number(swapCfg.maxOrderSizeUsd) || 10;
+    const ccPriceUsd = Number(mids.cc_usdcx) || Number(mids.usdc_cc) || 0;
+
+    if (ccPriceUsd <= 0) {
+      console.log(`${tag} [maker] No price data, retry in 10s`);
+      await sleep(10000);
+      continue;
+    }
+
+    // Check if available balance meets minimum order size
+    const availCcValueUsd = availCc * ccPriceUsd;
+    const canSellCc = availCcValueUsd >= minUsd;
+    const canSellUsdc = availUsdc >= minUsd;
+
+    if (!canSellCc && !canSellUsdc) {
+      console.log(
+        `${tag} [maker] Low available: CC=${availCc.toFixed(2)}/${ccBalance.toFixed(2)} ($${availCcValueUsd.toFixed(2)}) ` +
+        `USDC=${availUsdc.toFixed(2)}/${usdcBalance.toFixed(2)} — need >$${minUsd}`
+      );
+      const waitSec = humanLikeDelay(60, 120);
+      await sleep(waitSec * 1000);
+      continue;
+    }
+
+    // Pick direction: weighted random towards asset with more available value
+    let sellDirection;
+    if (canSellCc && canSellUsdc) {
+      const ccWeight = availCcValueUsd / (availCcValueUsd + availUsdc);
+      sellDirection = Math.random() < ccWeight ? "cc" : "usdc";
+    } else {
+      sellDirection = canSellCc ? "cc" : "usdc";
+    }
+
+    // Random edge between minBps and maxBps
+    const edgeBps = minBps + Math.random() * (maxBps - minBps);
+    const edgeFactor = 1 - edgeBps / 10000;
+
+    let side, srcAmount, dstAmount, srcLabel, dstLabel;
+
+    if (sellDirection === "cc") {
+      // Sell CC → Get USDC
+      const maxCcForOrder = Math.min(availCc, maxUsd / ccPriceUsd);
+      const minCcForOrder = minUsd / ccPriceUsd;
+      const actualCc = Number((minCcForOrder + Math.random() * Math.max(0, maxCcForOrder - minCcForOrder)).toFixed(6));
+      const askUsdc = Number((actualCc * ccPriceUsd * edgeFactor).toFixed(6));
+
+      side = "canton_sell_cc_for_usdc";
+      srcAmount = actualCc.toFixed(9).replace(/\.?0+$/, "");
+      dstAmount = askUsdc.toFixed(6).replace(/\.?0+$/, "");
+      srcLabel = `${actualCc.toFixed(4)} CC`;
+      dstLabel = `${askUsdc.toFixed(6)} USDC`;
+    } else {
+      // Sell USDC → Get CC
+      const maxUsdcForOrder = Math.min(availUsdc, maxUsd);
+      const minUsdcForOrder = minUsd;
+      const actualUsdc = Number((minUsdcForOrder + Math.random() * Math.max(0, maxUsdcForOrder - minUsdcForOrder)).toFixed(6));
+      const askCc = Number((actualUsdc / ccPriceUsd * edgeFactor).toFixed(6));
+
+      side = "eth_sell_usdc_for_cc";
+      srcAmount = actualUsdc.toFixed(6).replace(/\.?0+$/, "");
+      dstAmount = askCc.toFixed(9).replace(/\.?0+$/, "");
+      srcLabel = `${actualUsdc.toFixed(4)} USDC`;
+      dstLabel = `${askCc.toFixed(4)} CC`;
+    }
+
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "MAKE" });
+    console.log(`${tag} [maker] Creating: sell ${srcLabel} → ${dstLabel} (edge=${edgeBps.toFixed(0)}bps) [${openOrders.length + 1}/${maxOpenOrders}]`);
+
+    try {
+      const result = await client.createOtcOrder({
+        side,
+        srcAmountDecimal: srcAmount,
+        dstAmountDecimal: dstAmount,
+        expiresHours
+      });
+      const order = isObject(result && result.data && result.data.order) ? result.data.order : {};
+      console.log(`${tag} [maker] ✓ Order ${(order.id || "?").slice(0, 8)} status=${order.status || "?"}`);
+      ordersCreated++;
+      statsBucket.ordersCreated = (statsBucket.ordersCreated || 0) + 1;
+      updateOtcAccountSnapshot(dashboard, account.name, { mk: ordersCreated });
+    } catch (error) {
+      const errMsg = String(error.message || "");
+      if (errMsg.includes("429") || errMsg.toLowerCase().includes("too many")) {
+        const cooldownMin = Math.ceil(rateLimitCooldownMs / 60000);
+        makerCooldownUntil = Date.now() + rateLimitCooldownMs;
+        console.log(`${tag} [maker] ⚠ Rate limited! Cooling down for ${cooldownMin}min`);
+        statsBucket.rateLimits = (statsBucket.rateLimits || 0) + 1;
+        continue;
+      }
+      if (isOtcBalanceLockError(errMsg)) {
+        const lockSec = Number(makerCfg.balanceLockCooldownSeconds) || 120;
+        makerBalanceLockUntil = Date.now() + lockSec * 1000;
+        console.log(`${tag} [maker] ⚠ Balance lock on create — pause maker ${lockSec}s for settlement`);
+        statsBucket.balanceLocks = (statsBucket.balanceLocks || 0) + 1;
+        continue;
+      }
+      console.log(`${tag} [maker] ✗ Create failed: ${errMsg}`);
+      statsBucket.ordersFail = (statsBucket.ordersFail || 0) + 1;
+    }
+
+    // Refresh balance
+    try {
+      const balResp = await client.getBalances();
+      if (isObject(balResp && balResp.data)) {
+        balanceData = balResp.data;
+        const bal = formatOtcCcUsdc(balanceData);
+        updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+      }
+    } catch (_) { }
+
+    const cooldown = humanLikeDelay(
+      clampToNonNegativeInt(swapCfg.minDelaySeconds, 30),
+      clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
+    );
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "COOL" });
+    console.log(`${tag} [maker] cooldown ${cooldown}s`);
+    await sleep(cooldown * 1000);
+  }
+
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "DONE" });
+  return { account: account.name, ok: true, ordersCreated };
+}
+
+async function runOtcMakerFlow(context) {
+  const { config, accounts } = context;
+  const swapCfg = isObject(config.swap) ? config.swap : {};
+  if (!swapCfg.enabled) {
+    console.log("[otc-maker] config.swap.enabled = false. Aktifkan dulu.");
+    return;
+  }
+
+  const selectedAccounts = accounts.accounts;
+  if (selectedAccounts.length === 0) {
+    console.log("[otc-maker] Tidak ada akun terpilih.");
+    return;
+  }
+
+  const makerCfg = isObject(swapCfg.maker) ? swapCfg.maker : {};
+  const dashboard = attachOtcDashboard(context, "OTC-MAKER");
+  context.dashboard = dashboard;
+
+  console.log(`\n${"#".repeat(70)}`);
+  console.log(`[otc-maker] Maker mode — create CC↔USDC listings (bidirectional)`);
+  console.log(`[otc-maker] Accounts=${selectedAccounts.length} | BPS=${makerCfg.minBps}-${makerCfg.maxBps} | expires=${makerCfg.expiresHours || 6}h | maxOpen=${makerCfg.maxOpenOrders}/akun`);
+  console.log(`${"#".repeat(70)}\n`);
+
+  const statsBucket = { ordersCreated: 0, ordersFail: 0 };
+  const workers = Math.max(1, Number(swapCfg.workers) || 5);
+  const queue = [...selectedAccounts];
+  const inFlight = [];
+  const results = [];
+
+  const launchNext = () => {
+    while (inFlight.length < workers && queue.length > 0) {
+      const acc = queue.shift();
+      const p = runOtcMakerAccountWorker(acc, context, statsBucket)
+        .then((r) => { results.push(r); })
+        .catch((err) => { results.push({ account: acc.name, ok: false, error: err.message }); })
+        .finally(() => {
+          const idx = inFlight.indexOf(p);
+          if (idx >= 0) inFlight.splice(idx, 1);
+        });
+      inFlight.push(p);
+    }
+  };
+
+  try {
+    launchNext();
+    while (inFlight.length > 0) {
+      await Promise.race(inFlight);
+      launchNext();
+    }
+    console.log(`\n${"#".repeat(70)}`);
+    console.log(`[otc-maker] Done — created=${statsBucket.ordersCreated} fail=${statsBucket.ordersFail}`);
+    console.log(`${"#".repeat(70)}\n`);
+  } finally {
+    detachOtcDashboard(dashboard);
+    context.dashboard = null;
+  }
+}
+
+// =============================================================================
+// OTC Maker-Taker Flow — "Taker First, Maker Fill" strategy
+//
+// STRATEGY: The optimal Maker-Taker approach for 26 accounts:
+//
+// 1. TAKER FIRST: Every loop, scan for external orders at ≥25bps edge.
+//    Taking = instant volume, highest priority. If found, take immediately.
+//
+// 2. MAKER FILL: If no take opportunity, create a listing from whatever
+//    asset the account holds (CC→USDC or USDC→CC). Bidirectional flow
+//    creates a natural "market maker" pattern across accounts.
+//
+// 3. STALE CLEANUP: Cancel own orders that sat untaken past 50% of expiry.
+//    This frees locked balance for new listings at fresher prices.
+//
+// 4. CROSS-ACCOUNT SYNERGY: Account A lists sell CC→USDC,
+//    Account B (with USDC) can take it externally if edge is ≥25bps.
+//    CC flows A→B via OTC, USDC flows B→A. Volume for both.
+//
+// This creates maximum activity with minimum capital waste.
+// =============================================================================
+
+async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
+  const { config, tokens, accounts, dashboard } = context;
+  const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+  tokens.accounts[account.name] = accountToken;
+  const accountConfig = cloneRuntimeConfig(config);
+  applyTokenProfileToConfig(accountConfig, accountToken);
+  const tag = `[${account.name}]`;
+  const swapCfg = isObject(config.swap) ? config.swap : {};
+  const makerCfg = isObject(swapCfg.maker) ? swapCfg.maker : {};
+  const takerCfg = isObject(swapCfg.taker) ? swapCfg.taker : {};
+  const ownUsernames = new Set(
+    (Array.isArray(accounts && accounts.accounts) ? accounts.accounts : [])
+      .map((a) => normalizeOtcUsername(a && a.name))
+      .filter(Boolean)
+  );
+  const pickerCtx = { ownUsernames };
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "SESS" });
+
+  const client = new RootsFiApiClient(accountConfig);
+
+  if (!client.hasAccountSessionCookie()) {
+    console.log(`${tag} [mt] No session cookie — run OTP mode first`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "NOSESS" });
+    return { account: account.name, ok: false, error: "no-session" };
+  }
+
+  let sessionReuse = null;
+  try {
+    sessionReuse = await attemptSessionReuse(client, accountConfig, () => { }, tag);
+  } catch (error) {
+    console.log(`${tag} [mt] Session reuse failed: ${error.message}`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
+    return { account: account.name, ok: false, error: error.message };
+  }
+  if (!sessionReuse || !sessionReuse.ok) {
+    console.log(`${tag} [mt] Session not reusable`);
+    updateOtcAccountSnapshot(dashboard, account.name, { status: "ERR" });
+    return { account: account.name, ok: false, error: "session-not-ok" };
+  }
+
+  let balanceData = sessionReuse.balancesData;
+  const selfProfileId = getSelfProfileIdFromBalance(balanceData);
+  const initBal = formatOtcCcUsdc(balanceData);
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  await refreshOtcAccountPoints(client, dashboard, account.name, tag);
+  console.log(`${tag} [mt] Profile=${selfProfileId || "?"} — start (Maker→429→Taker cycle)`);
+
+  const minBps = Number.isFinite(makerCfg.minBps) ? makerCfg.minBps : 10;
+  const maxBps = Number.isFinite(makerCfg.maxBps) ? makerCfg.maxBps : 100;
+  const expiresHours = Number(makerCfg.expiresHours) || 6;
+  const maxOpenOrders = Number(makerCfg.maxOpenOrders) || 3;
+  const rateLimitCooldownMs = (Number(makerCfg.rateLimitCooldownMinutes) || 60) * 60 * 1000;
+  const takerMinBps = Number.isFinite(takerCfg.minBps) ? takerCfg.minBps : 25;
+  const idleThresholdMs = Math.max(1, Number(makerCfg.takerIdleSecondsBeforeMaker) || 10) * 1000;
+  const maxLoop = Number(swapCfg.maxLoopTakes) || 100;
+  let takesOk = 0;
+  let ordersCreated = 0;
+  let ordersCancelled = 0;
+  let makerCooldownUntil = 0; // when 429 hit, maker pauses but taker continues
+  let makerBalanceLockUntil = 0; // when create returns "balance below listed amount" — wait pending settlement
+  let takerBalanceLockUntil = 0; // when take returns "balance below required amount"
+  let lastProfitableHitAt = Date.now(); // updated when scan finds a takeable order
+  let mtActivityCount = 0;
+  const mtPointsRefreshEvery = 5;
+
+  for (let loop = 0; loop < maxLoop; loop++) {
+    pruneOtcOrderBlacklist();
+    let orders = [];
+    let myOrders = [];
+    let mids = {};
+    try {
+      const [allRes, mineRes, refRes] = await Promise.all([
+        client.getCrossOtcOrders(false),
+        client.getCrossOtcOrders(true),
+        client.getCrossOtcReference()
+      ]);
+      orders = Array.isArray(allRes && allRes.data && allRes.data.orders)
+        ? allRes.data.orders
+        : (Array.isArray(allRes && allRes.data) ? allRes.data : []);
+      myOrders = Array.isArray(mineRes && mineRes.data && mineRes.data.orders)
+        ? mineRes.data.orders
+        : (Array.isArray(mineRes && mineRes.data) ? mineRes.data : []);
+      const refData = isObject(refRes && refRes.data) ? refRes.data : {};
+      mids = isObject(refData.mids) ? refData.mids : {};
+    } catch (error) {
+      console.log(`${tag} [mt] Fetch failed: ${error.message}`);
+      await sleep(15000);
+      continue;
+    }
+
+    const ccPriceUsd = Number(mids.cc_usdcx) || Number(mids.usdc_cc) || 0;
+    if (ccPriceUsd <= 0) {
+      console.log(`${tag} [mt] No price data, retry in 10s`);
+      await sleep(10000);
+      continue;
+    }
+
+    const isMakerCooldown = Date.now() < makerCooldownUntil;
+    const isMakerBalanceLock = Date.now() < makerBalanceLockUntil;
+    const isTakerBalanceLock = Date.now() < takerBalanceLockUntil;
+
+    // ═══════════════════════════════════════════════════
+    // PHASE 1: TAKER (drain) — keep taking while balance allows.
+    //   Maker only runs if zero successful takes this iteration.
+    //   Balance-aware: pickBestOtcOrder filters orders we cannot afford,
+    //   and we refresh balance after each take so next pick is accurate.
+    // ═══════════════════════════════════════════════════
+    const takerSwapCfg = { ...swapCfg, minEdgeBps: takerMinBps };
+    let didTake = false;
+    let drainCount = 0;
+    const maxDrainPerLoop = Math.max(1, clampToNonNegativeInt(takerCfg.maxDrainPerLoop, 10));
+
+    if (isTakerBalanceLock && loop % 5 === 0) {
+      const remainSec = Math.ceil((takerBalanceLockUntil - Date.now()) / 1000);
+      console.log(`${tag} [taker] ⏸ Balance-lock cooldown ${remainSec}s (waiting pending settlement)`);
+    }
+
+    while (!isTakerBalanceLock && drainCount < maxDrainPerLoop) {
+      const pick = pickBestOtcOrder(orders, mids, balanceData, selfProfileId, takerSwapCfg, pickerCtx);
+      if (!pick) break;
+
+      // Mark "the orderbook had something profitable I could attempt" — even if take fails later
+      lastProfitableHitAt = Date.now();
+
+      const { order, edge } = pick;
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "TAKE" });
+      console.log(
+        `${tag} [taker] PICK ${order.id.slice(0, 8)} ` +
+        `${order.srcAsset}→${order.dstAsset} edge=${edge.edgeBps.toFixed(1)}bps ` +
+        `(drain ${drainCount + 1}/${maxDrainPerLoop})`
+      );
+      const blacklistTtlMs = (Number(takerCfg.orderBlacklistSeconds) || 60) * 1000;
+
+      // Reserve
+      let reserveOk = false;
+      try {
+        await client.reserveOtcOrder(order.id);
+        reserveOk = true;
+      } catch (error) {
+        const errMsg = String(error.message || "");
+        if (isOtcOrderClosedError(errMsg)) {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${tag} [taker] ✗ Reserve race ${order.id.slice(0, 8)} (409) — blacklist, try next`);
+        } else {
+          console.log(`${tag} [taker] ✗ Reserve failed: ${errMsg}`);
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+        }
+        statsBucket.takeFail = (statsBucket.takeFail || 0) + 1;
+      }
+
+      if (!reserveOk) {
+        // Try the next-best order in this same drain iteration
+        continue;
+      }
+
+      // Take
+      let takeOk = false;
+      let breakAfterThis = false;
+      try {
+        const takeResult = await client.takeOtcOrder(order.id);
+        const filled = isObject(takeResult && takeResult.data && takeResult.data.order) ? takeResult.data.order : {};
+        const makerUsername = normalizeOtcUsername(order.makerUsername);
+        if (makerUsername) {
+          recordOtcCounterpartyTake(makerUsername);
+          const cnt = pruneOtcCounterpartyHistory(makerUsername, Date.now()).length;
+          const limit = Number(takerCfg.maxTakesPerCounterpartyPerWeek)
+            || Number(takerCfg.maxTakesPerCounterpartyPerHour) || 0;
+          console.log(
+            `${tag} [taker] ✓ TOOK ${order.id.slice(0, 8)} status=${filled.status || "?"} ` +
+            `maker=${order.makerUsername} (${cnt}${limit > 0 ? `/${limit}` : ""}/wk)`
+          );
+        } else {
+          console.log(`${tag} [taker] ✓ TOOK ${order.id.slice(0, 8)} status=${filled.status || "?"}`);
+        }
+        takesOk++;
+        statsBucket.takeOk = (statsBucket.takeOk || 0) + 1;
+        didTake = true;
+        takeOk = true;
+        // Skip this order on next pick (cached `orders` array still has it as "open")
+        blacklistOtcOrder(order.id, blacklistTtlMs);
+        updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
+        mtActivityCount += 1;
+        if (mtActivityCount % mtPointsRefreshEvery === 0) {
+          await refreshOtcAccountPoints(client, dashboard, account.name, tag);
+        }
+      } catch (error) {
+        const errMsg = String(error.message || "");
+        if (isOtcOrderClosedError(errMsg)) {
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${tag} [taker] ✗ Take race ${order.id.slice(0, 8)} (409) — blacklist, try next`);
+        } else if (isOtcBalanceLockError(errMsg)) {
+          const lockSec = Number(takerCfg.balanceLockCooldownSeconds) || 90;
+          takerBalanceLockUntil = Date.now() + lockSec * 1000;
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          console.log(`${tag} [taker] ⚠ Balance lock on take ${order.id.slice(0, 8)} — pause taker ${lockSec}s, end drain`);
+          breakAfterThis = true;
+        } else {
+          console.log(`${tag} [taker] ✗ Take failed: ${errMsg}`);
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+        }
+        statsBucket.takeFail = (statsBucket.takeFail || 0) + 1;
+      }
+
+      drainCount++;
+
+      if (breakAfterThis) break;
+
+      if (takeOk) {
+        // Refresh balance immediately so next pick filters by post-take balance
+        try {
+          const balResp = await client.getBalances();
+          if (isObject(balResp && balResp.data)) {
+            balanceData = balResp.data;
+            const bal = formatOtcCcUsdc(balanceData);
+            updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+          }
+        } catch (_) { }
+      }
+    }
+
+    if (didTake && drainCount > 1) {
+      console.log(`${tag} [taker] drain complete: ${drainCount} attempts this loop`);
+    }
+
+    // ═══════════════════════════════════════════════════
+    // PHASE 2: CLEANUP — cancel stale own orders (>50% expired)
+    // ═══════════════════════════════════════════════════
+    const openOrders = myOrders.filter(o => o.status === "open");
+    let lockedCc = 0;
+    let lockedUsdc = 0;
+    for (const o of openOrders) {
+      const src = Number(o.srcAmountDecimal) || 0;
+      const srcAsset = String(o.srcAsset || "").toUpperCase();
+      if (srcAsset === "CC") lockedCc += src;
+      else if (srcAsset === "USDC") lockedUsdc += src;
+    }
+
+    const now = Date.now();
+    const cancelAfterIdleMs = Math.max(60_000, (Number(makerCfg.cancelAfterIdleMinutes) || 5) * 60_000);
+    let cancelledThisLoop = 0;
+    for (const myOrder of openOrders) {
+      // Don't cancel orders currently reserved by a taker — let settlement complete
+      if (myOrder.reservedByProfileId) continue;
+
+      const createdMs = Date.parse(myOrder.createdAt || "");
+      const expiresMs = Date.parse(myOrder.expiresAt || "");
+      if (!Number.isFinite(createdMs) || !Number.isFinite(expiresMs)) continue;
+      const totalLifeMs = expiresMs - createdMs;
+      const elapsedMs = now - createdMs;
+
+      const idleTooLong = elapsedMs >= cancelAfterIdleMs;
+      const pastHalfLife = totalLifeMs > 0 && elapsedMs > totalLifeMs * 0.5;
+      if (!idleTooLong && !pastHalfLife) continue;
+
+      const cancelReason = idleTooLong
+        ? `idle ${(elapsedMs / 60000).toFixed(1)}min ≥ ${(cancelAfterIdleMs / 60000).toFixed(0)}min threshold`
+        : `past half-life`;
+      try {
+        await client.cancelOtcOrder(myOrder.id);
+        // Free locked balance
+        const cancelledSrc = Number(myOrder.srcAmountDecimal) || 0;
+        if (String(myOrder.srcAsset || "").toUpperCase() === "CC") lockedCc -= cancelledSrc;
+        else if (String(myOrder.srcAsset || "").toUpperCase() === "USDC") lockedUsdc -= cancelledSrc;
+        console.log(`${tag} [maker] ♻ Cancelled ${myOrder.id.slice(0, 8)} (${cancelReason})`);
+        ordersCancelled++;
+        cancelledThisLoop++;
+        statsBucket.ordersCancelled = (statsBucket.ordersCancelled || 0) + 1;
+      } catch (_) { }
+    }
+
+    // ═══════════════════════════════════════════════════
+    // PHASE 3: MAKER — create listing only when orderbook is idle
+    //   Trigger: no profitable take seen for `takerIdleSecondsBeforeMaker`.
+    //   (SKIPPED during maker cooldown / balance lock)
+    // ═══════════════════════════════════════════════════
+    const currentOpenCount = openOrders.length - cancelledThisLoop;
+    const msSinceProfitable = Date.now() - lastProfitableHitAt;
+    const idleEnoughForMaker = msSinceProfitable >= idleThresholdMs;
+
+    if (isMakerCooldown) {
+      // During cooldown: taker-only mode
+      if (loop % 10 === 0) {
+        const remainMin = Math.ceil((makerCooldownUntil - Date.now()) / 60000);
+        console.log(`${tag} [mt] ⏸ Maker cooldown — ${remainMin}min left — taker-only mode`);
+      }
+    } else if (isMakerBalanceLock) {
+      // Pending sends/open swaps eat available balance — wait for settlement
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "LOCK" });
+      if (loop % 5 === 0) {
+        const remainSec = Math.ceil((makerBalanceLockUntil - Date.now()) / 1000);
+        console.log(`${tag} [maker] ⏸ Balance-lock cooldown ${remainSec}s (locked CC=${lockedCc.toFixed(2)} USDC=${lockedUsdc.toFixed(2)} — waiting settlement)`);
+      }
+    } else if (!didTake && !idleEnoughForMaker) {
+      // Still in "waiting for takers" window — keep scanning, don't lock balance in listing yet
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "WAIT" });
+      if (loop % 3 === 0) {
+        const remainSec = Math.max(0, Math.ceil((idleThresholdMs - msSinceProfitable) / 1000));
+        const elapsedSec = (msSinceProfitable / 1000).toFixed(0);
+        console.log(`${tag} [mt] taker-mode (idle ${elapsedSec}s, switch to maker in ${remainSec}s if still empty)`);
+      }
+    } else if (!didTake && idleEnoughForMaker && currentOpenCount < maxOpenOrders) {
+      // Refresh balance before maker create
+      try {
+        const balResp = await client.getBalances();
+        if (isObject(balResp && balResp.data)) {
+          balanceData = balResp.data;
+          const bal = formatOtcCcUsdc(balanceData);
+          updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+        }
+      } catch (_) { }
+
+      const ccBalance = otcGetAccountBalance("CC", balanceData);
+      const usdcBalance = otcGetAccountBalance("USDC", balanceData);
+      const availCc = Math.max(0, ccBalance - Math.max(0, lockedCc));
+      const availUsdc = Math.max(0, usdcBalance - Math.max(0, lockedUsdc));
+      const minUsd = Number(swapCfg.minOrderSizeUsd) || 1.05;
+      const maxUsd = Number(swapCfg.maxOrderSizeUsd) || 10;
+
+      const availCcValueUsd = availCc * ccPriceUsd;
+      const canSellCc = availCcValueUsd >= minUsd;
+      const canSellUsdc = availUsdc >= minUsd;
+
+      if (canSellCc || canSellUsdc) {
+        let sellDirection;
+        if (canSellCc && canSellUsdc) {
+          const ccWeight = availCcValueUsd / (availCcValueUsd + availUsdc);
+          sellDirection = Math.random() < ccWeight ? "cc" : "usdc";
+        } else {
+          sellDirection = canSellCc ? "cc" : "usdc";
+        }
+
+        const edgeBps = minBps + Math.random() * (maxBps - minBps);
+        const edgeFactor = 1 - edgeBps / 10000;
+
+        let side, srcAmount, dstAmount, srcLabel, dstLabel;
+
+        if (sellDirection === "cc") {
+          const maxCcForOrder = Math.min(availCc, maxUsd / ccPriceUsd);
+          const minCcForOrder = minUsd / ccPriceUsd;
+          const actualCc = Number((minCcForOrder + Math.random() * Math.max(0, maxCcForOrder - minCcForOrder)).toFixed(6));
+          const askUsdc = Number((actualCc * ccPriceUsd * edgeFactor).toFixed(6));
+          side = "canton_sell_cc_for_usdc";
+          srcAmount = actualCc.toFixed(9).replace(/\.?0+$/, "");
+          dstAmount = askUsdc.toFixed(6).replace(/\.?0+$/, "");
+          srcLabel = `${actualCc.toFixed(4)} CC`;
+          dstLabel = `${askUsdc.toFixed(6)} USDC`;
+        } else {
+          const maxUsdcForOrder = Math.min(availUsdc, maxUsd);
+          const minUsdcForOrder = minUsd;
+          const actualUsdc = Number((minUsdcForOrder + Math.random() * Math.max(0, maxUsdcForOrder - minUsdcForOrder)).toFixed(6));
+          const askCc = Number((actualUsdc / ccPriceUsd * edgeFactor).toFixed(6));
+          side = "eth_sell_usdc_for_cc";
+          srcAmount = actualUsdc.toFixed(6).replace(/\.?0+$/, "");
+          dstAmount = askCc.toFixed(9).replace(/\.?0+$/, "");
+          srcLabel = `${actualUsdc.toFixed(4)} USDC`;
+          dstLabel = `${askCc.toFixed(4)} CC`;
+        }
+
+        updateOtcAccountSnapshot(dashboard, account.name, { status: "MAKE" });
+        console.log(`${tag} [maker] Creating: sell ${srcLabel} → ${dstLabel} (edge=${edgeBps.toFixed(0)}bps) [${currentOpenCount + 1}/${maxOpenOrders}]`);
+        try {
+          await client.createOtcOrder({ side, srcAmountDecimal: srcAmount, dstAmountDecimal: dstAmount, expiresHours });
+          ordersCreated++;
+          statsBucket.ordersCreated = (statsBucket.ordersCreated || 0) + 1;
+          updateOtcAccountSnapshot(dashboard, account.name, { mk: ordersCreated });
+          mtActivityCount += 1;
+          if (mtActivityCount % mtPointsRefreshEvery === 0) {
+            await refreshOtcAccountPoints(client, dashboard, account.name, tag);
+          }
+        } catch (error) {
+          const errMsg = String(error.message || "");
+          if (errMsg.includes("429") || errMsg.toLowerCase().includes("too many")) {
+            const cooldownMin = Math.ceil(rateLimitCooldownMs / 60000);
+            makerCooldownUntil = Date.now() + rateLimitCooldownMs;
+            console.log(`${tag} [maker] ⚠ Rate limited! Switching to taker-only for ${cooldownMin}min`);
+            statsBucket.rateLimits = (statsBucket.rateLimits || 0) + 1;
+          } else if (isOtcBalanceLockError(errMsg)) {
+            const lockSec = Number(makerCfg.balanceLockCooldownSeconds) || 120;
+            makerBalanceLockUntil = Date.now() + lockSec * 1000;
+            console.log(`${tag} [maker] ⚠ Balance lock on create — pause maker ${lockSec}s for settlement (locked CC=${lockedCc.toFixed(2)} USDC=${lockedUsdc.toFixed(2)})`);
+            statsBucket.balanceLocks = (statsBucket.balanceLocks || 0) + 1;
+          } else {
+            console.log(`${tag} [maker] ✗ Create failed: ${errMsg}`);
+            statsBucket.ordersFail = (statsBucket.ordersFail || 0) + 1;
+          }
+        }
+      } else {
+        if (loop % 5 === 0) {
+          console.log(`${tag} [maker] Low avail: CC=${availCc.toFixed(2)}/${ccBalance.toFixed(2)} USDC=${availUsdc.toFixed(2)}/${usdcBalance.toFixed(2)}`);
+        }
+      }
+    }
+
+    // Refresh balance for next iteration's CC/USDC display
+    try {
+      const balResp = await client.getBalances();
+      if (isObject(balResp && balResp.data)) {
+        balanceData = balResp.data;
+        const bal = formatOtcCcUsdc(balanceData);
+        updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+      }
+    } catch (_) { }
+
+    // Cooldown:
+    //   - fully stalled (maker cooldown + taker balance lock) → 15s+
+    //   - WAIT mode (no take, no make this iter, idle<threshold, no locks) → fast scan
+    //     (honors "wajib ambil" rule: re-scan orderbook ASAP for new takeable orders)
+    //   - otherwise (took or made or in lock) → human-like 5-10s
+    const fullyStalled = (isMakerCooldown || isMakerBalanceLock) && isTakerBalanceLock;
+    const inWaitMode = !didTake
+      && !idleEnoughForMaker
+      && !isMakerCooldown
+      && !isMakerBalanceLock
+      && !isTakerBalanceLock;
+    let cooldown;
+    if (fullyStalled) {
+      cooldown = Math.max(15, clampToNonNegativeInt(swapCfg.minDelaySeconds, 30));
+    } else if (inWaitMode) {
+      cooldown = Math.max(1, Number(takerCfg.fastScanIntervalSeconds) || 2);
+    } else {
+      cooldown = humanLikeDelay(
+        clampToNonNegativeInt(swapCfg.minDelaySeconds, 30),
+        clampToNonNegativeInt(swapCfg.maxDelaySeconds, 90)
+      );
+    }
+    if (!isMakerBalanceLock && !isTakerBalanceLock && !isMakerCooldown && !inWaitMode) {
+      updateOtcAccountSnapshot(dashboard, account.name, { status: "COOL" });
+    }
+    await sleep(cooldown * 1000);
+  }
+
+  updateOtcAccountSnapshot(dashboard, account.name, { status: "DONE" });
+  return { account: account.name, ok: true, takesOk, ordersCreated, ordersCancelled };
+}
+
+async function runOtcMakerTakerFlow(context) {
+  const { config, accounts } = context;
+  const swapCfg = isObject(config.swap) ? config.swap : {};
+  if (!swapCfg.enabled) {
+    console.log("[otc-mt] config.swap.enabled = false. Aktifkan dulu.");
+    return;
+  }
+
+  const selectedAccounts = accounts.accounts;
+  if (selectedAccounts.length === 0) {
+    console.log("[otc-mt] Tidak ada akun terpilih.");
+    return;
+  }
+
+  const makerCfg = isObject(swapCfg.maker) ? swapCfg.maker : {};
+  const takerCfg = isObject(swapCfg.taker) ? swapCfg.taker : {};
+  const dashboard = attachOtcDashboard(context, "OTC-MAKER-TAKER");
+  context.dashboard = dashboard;
+
+  console.log(`\n${"#".repeat(70)}`);
+  console.log(`[otc-mt] Maker-Taker — "Maker→429→Taker" cycle strategy`);
+  console.log(`[otc-mt] Accounts=${selectedAccounts.length} | MakerBPS=${makerCfg.minBps}-${makerCfg.maxBps} | TakerMinBPS=${takerCfg.minBps} | maxOpen=${makerCfg.maxOpenOrders}/akun`);
+  console.log(`[otc-mt] Pair: CC(Canton) ↔ USDC(Base) | Cooldown=${makerCfg.rateLimitCooldownMinutes}min`);
+  console.log(`${"#".repeat(70)}\n`);
+
+  const statsBucket = { ordersCreated: 0, ordersFail: 0, ordersCancelled: 0, takeOk: 0, takeFail: 0 };
+  const workers = Math.max(1, Number(swapCfg.workers) || 5);
+  const queue = [...selectedAccounts];
+  const inFlight = [];
+  const results = [];
+
+  const launchNext = () => {
+    while (inFlight.length < workers && queue.length > 0) {
+      const acc = queue.shift();
+      const p = runOtcMakerTakerAccountWorker(acc, context, statsBucket)
+        .then((r) => { results.push(r); })
+        .catch((err) => { results.push({ account: acc.name, ok: false, error: err.message }); })
+        .finally(() => {
+          const idx = inFlight.indexOf(p);
+          if (idx >= 0) inFlight.splice(idx, 1);
+        });
+      inFlight.push(p);
+    }
+  };
+
+  try {
+    launchNext();
+    while (inFlight.length > 0) {
+      await Promise.race(inFlight);
+      launchNext();
+    }
+    console.log(`\n${"#".repeat(70)}`);
+    console.log(`[otc-mt] Done — listings=${statsBucket.ordersCreated} takes=${statsBucket.takeOk} cancelled=${statsBucket.ordersCancelled} fail=${statsBucket.takeFail + statsBucket.ordersFail}`);
+    console.log(`${"#".repeat(70)}\n`);
+  } finally {
+    detachOtcDashboard(dashboard);
+    context.dashboard = null;
+  }
+}
+
+// =============================================================================
+// OTC Ring-Hybrid (legacy — self-listing antar akun + camouflage external take)
 // =============================================================================
 
 const OTC_PAIR_SIDES = {
-  cc_usdcx:    { sellBaseSide: "canton_sell_cc_for_usdcx",   sellQuoteSide: "canton_sell_usdcx_for_cc",   baseAsset: "CC",    quoteAsset: "USDCx" },
-  usdc_cc:     { sellBaseSide: "canton_sell_usdc_for_cc",    sellQuoteSide: "canton_sell_cc_for_usdc",    baseAsset: "USDC",  quoteAsset: "CC"    },
-  usdc_usdcx:  { sellBaseSide: "canton_sell_usdc_for_usdcx", sellQuoteSide: "canton_sell_usdcx_for_usdc", baseAsset: "USDC",  quoteAsset: "USDCx" }
+  cc_usdcx: { sellBaseSide: "canton_sell_cc_for_usdcx", sellQuoteSide: "canton_sell_usdcx_for_cc", baseAsset: "CC", quoteAsset: "USDCx" },
+  usdc_cc: { sellBaseSide: "canton_sell_usdc_for_cc", sellQuoteSide: "canton_sell_cc_for_usdc", baseAsset: "USDC", quoteAsset: "CC" },
+  usdc_usdcx: { sellBaseSide: "canton_sell_usdc_for_usdcx", sellQuoteSide: "canton_sell_usdcx_for_usdc", baseAsset: "USDC", quoteAsset: "USDCx" }
 };
 
 function shuffleArray(arr) {
@@ -8973,7 +10223,7 @@ async function setupOtcRingWorker(account, config, tokens) {
 
   let sessionReuse;
   try {
-    sessionReuse = await attemptSessionReuse(client, accountConfig, () => {}, tag);
+    sessionReuse = await attemptSessionReuse(client, accountConfig, () => { }, tag);
   } catch (error) {
     console.log(`${tag} [otc-ring] Session reuse threw: ${error.message}`);
     return null;
@@ -9643,22 +10893,23 @@ async function run() {
     return;
   }
 
-  if (sendMode === "otc-trading") {
-    const otcSelection = await promptAccountSelection(accounts.accounts);
-    const otcAccounts = otcSelection.selectedAccounts;
-    const otcMode = String((config.swap && config.swap.mode) || "ring-hybrid").toLowerCase();
-    console.log(`\n[init] OTC mode=${otcMode} - akun terpilih: ${otcAccounts.length}`);
+  if (sendMode === "otc-maker" || sendMode === "otc-taker" || sendMode === "otc-maker-taker") {
+    const otcAccounts = accounts.accounts;
+    console.log(`\n[init] OTC mode=${sendMode} - using all ${otcAccounts.length} accounts`);
     const otcContext = {
       config,
       accounts: { ...accounts, accounts: otcAccounts },
       tokens,
       tokensPath,
-      args
+      args,
+      otcMode: sendMode
     };
-    if (otcMode === "take-only") {
+    if (sendMode === "otc-taker") {
       await runOtcTradingFlow(otcContext);
+    } else if (sendMode === "otc-maker") {
+      await runOtcMakerFlow(otcContext);
     } else {
-      await runOtcRingHybridFlow(otcContext);
+      await runOtcMakerTakerFlow(otcContext);
     }
     return;
   }
