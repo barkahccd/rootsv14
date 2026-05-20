@@ -45,7 +45,7 @@
     "solverUrl": [
       ""
     ],
-    "apiKey": "uaDYSg1dyYlQgamtOWQgVDJH1bqa9r8i"
+    "apiKey": ""
   },
   "safety": {
     "minHoldBalanceCc": 1
@@ -56,8 +56,8 @@
   },
   "telegram": {
     "enabled": true,
-    "botToken": "8776128404:AAG9AoJk2mB_N4ovGIWtCttoM0UnY9TNPoY"",
-    "allowedChatIds": [1118073042],
+    "botToken": """,
+    "allowedChatIds": [,
     "autoReport": {
       "enabled": true,
       "intervalMinutes": 30
